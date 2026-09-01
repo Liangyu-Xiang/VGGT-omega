@@ -41,3 +41,19 @@ skyseg.onnx.tmp
 !.env.example
 *.pem
 *.key
+
+# Sparse-VGGT / SpargeAttn local build artifacts
+third_party/**/build/
+third_party/**/dist/
+third_party/**/*.egg-info/
+third_party/**/*.so
+third_party/**/*.o
+third_party/**/*.a
+third_party/**/*.ptx
+third_party/**/*.cubin
+third_party/**/*.fatbin
+third_party/**/*.whl
+third_party/**/__pycache__/
+third_party/**/*.pyc
+third_party/**/.triton/
+third_party/**/.ninja_*
