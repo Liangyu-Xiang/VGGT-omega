@@ -174,6 +174,7 @@ class Aggregator(nn.Module):
         frame_fusion_recompute_each_global: bool = False,
         frame_fusion_recompute_layers: tuple[int, ...] | list[int] | str | None = None,
         frame_fusion_lambda_cost: float = 0.15,
+        frame_fusion_fixed_compression_ratio: float | None = None,
         frame_fusion_merge_top_similarity_percent: float = 100.0,
         frame_fusion_layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,
         frame_fusion_min_keep_ratio: float = 0.05,
@@ -344,10 +345,11 @@ class Aggregator(nn.Module):
             "representative-log",
             "kv-only",
             "replicated",
+            "last-representative",
         }:
             raise ValueError(
                 "frame_fusion_attention_variant must be representative, representative-log, "
-                "kv-only, or replicated, "
+                "kv-only, replicated, or last-representative, "
                 f"got {frame_fusion_attention_variant!r}"
             )
         self.frame_fusion_attention_variant = frame_fusion_attention_variant
@@ -434,6 +436,7 @@ class Aggregator(nn.Module):
             recompute_each_global=frame_fusion_recompute_each_global,
             recompute_layers=frame_fusion_recompute_layers,
             lambda_cost=frame_fusion_lambda_cost,
+            fixed_compression_ratio=frame_fusion_fixed_compression_ratio,
             merge_top_similarity_percent=frame_fusion_merge_top_similarity_percent,
             layer_lambdas=frame_fusion_layer_lambdas,
             spatial_radius=frame_fusion_spatial_radius,
@@ -751,6 +754,7 @@ class Aggregator(nn.Module):
         recompute_each_global: bool = False,
         recompute_layers: tuple[int, ...] | list[int] | str | None = None,
         lambda_cost: float = 0.15,
+        fixed_compression_ratio: float | None = None,
         merge_top_similarity_percent: float = 100.0,
         layer_lambdas: tuple[float, ...] | list[float] | dict[int, float] | str | None = None,
         spatial_radius: int = 1,
@@ -838,6 +842,13 @@ class Aggregator(nn.Module):
         lambda_cost = float(lambda_cost)
         if lambda_cost < 0.0:
             raise ValueError(f"frame_fusion_lambda_cost must be non-negative, got {lambda_cost}")
+        if fixed_compression_ratio is not None:
+            fixed_compression_ratio = float(fixed_compression_ratio)
+            if not 0.0 <= fixed_compression_ratio < 1.0:
+                raise ValueError(
+                    "frame_fusion_fixed_compression_ratio must be in [0, 1), "
+                    f"got {fixed_compression_ratio}"
+                )
         merge_top_similarity_percent = float(merge_top_similarity_percent)
         if not 0.0 < merge_top_similarity_percent <= 100.0:
             raise ValueError(
@@ -1012,6 +1023,7 @@ class Aggregator(nn.Module):
         self.frame_fusion_recompute_each_global = recompute_each_global
         self.frame_fusion_recompute_layers = tuple(recompute_layers)
         self.frame_fusion_lambda_cost = lambda_cost
+        self.frame_fusion_fixed_compression_ratio = fixed_compression_ratio
         self.frame_fusion_merge_top_similarity_percent = merge_top_similarity_percent
         self.frame_fusion_lambda_cost_by_layer = self._normalize_frame_fusion_layer_lambdas(
             layer_lambdas,
@@ -2730,6 +2742,7 @@ class Aggregator(nn.Module):
         lambda_cost: float,
         cost_denominator: float | None = None,
         prefer_best_parent: bool = True,
+        fixed_compression_ratio: float | None = None,
         merge_top_similarity_percent: float = 100.0,
         initial_edges_are_unique: bool = False,
     ) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
@@ -2737,9 +2750,11 @@ class Aggregator(nn.Module):
 
         Each round evaluates the exact whole-group merge increment on every
         current graph edge, selects ``A-best(B)``/``B-best(A)`` pairs, and
-        accepts only pairs with ``delta_E < 2 * lambda_cost``.  Mutual pairs
+        By default, accepts only pairs with ``delta_E < 2 * lambda_cost``.
+        When ``fixed_compression_ratio`` is set, it accepts the same mutual
+        pairs until the requested active-token target is reached. Mutual pairs
         are disjoint, so all accepted pairs can be merged in one vectorized
-        component update.  The graph is maintained as a compact edge tensor;
+        component update. The graph is maintained as a compact edge tensor;
         no Python adjacency sets or full merge curve are materialized.
         """
 
@@ -2756,6 +2771,11 @@ class Aggregator(nn.Module):
             )
         if lambda_cost < 0.0:
             raise ValueError("lambda_cost must be non-negative")
+        if fixed_compression_ratio is not None and not 0.0 <= float(fixed_compression_ratio) < 1.0:
+            raise ValueError(
+                "fixed_compression_ratio must be in [0, 1), "
+                f"got {fixed_compression_ratio}"
+            )
         merge_top_similarity_percent = float(merge_top_similarity_percent)
         if not 0.0 < merge_top_similarity_percent <= 100.0:
             raise ValueError(
@@ -2829,6 +2849,13 @@ class Aggregator(nn.Module):
                 int(np.ceil(count * float(min_keep_ratio))),
                 int(np.count_nonzero(protected)),
             )
+        fixed_target_active = None
+        if fixed_compression_ratio is not None:
+            fixed_target_active = max(
+                int(np.ceil(count * (1.0 - float(fixed_compression_ratio)))),
+                min_keep,
+                int(np.count_nonzero(protected)),
+            )
         max_token_count = max(
             float(count if cost_denominator is None else cost_denominator),
             1.0,
@@ -2856,8 +2883,13 @@ class Aggregator(nn.Module):
 
         while edge_left.numel():
             component_count = int(group_weights.numel())
-            if component_count <= min_keep:
-                stop_reason = "minimum_keep_ratio"
+            active_floor = fixed_target_active if fixed_target_active is not None else min_keep
+            if component_count <= active_floor:
+                stop_reason = (
+                    "fixed_compression_target"
+                    if fixed_target_active is not None
+                    else "minimum_keep_ratio"
+                )
                 break
 
             edge_valid = (
@@ -3019,11 +3051,15 @@ class Aggregator(nn.Module):
                 if prefer_best_parent
                 else left_error
             ) - group_errors[pair_left] - group_errors[pair_right]
-            acceptable = pair_delta < merge_threshold
+            acceptable = (
+                torch.ones_like(pair_delta, dtype=torch.bool)
+                if fixed_target_active is not None
+                else pair_delta < merge_threshold
+            )
             if similarity_keep is not None:
                 acceptable &= similarity_keep
-            if min_keep:
-                available = max(component_count - min_keep, 0)
+            if active_floor:
+                available = max(component_count - active_floor, 0)
                 # Mutual pairs are disjoint.  In the common case their total
                 # count already fits above the floor, avoiding a GPU scalar
                 # synchronization merely to count the acceptable subset.
@@ -3160,6 +3196,8 @@ class Aggregator(nn.Module):
         final_representatives = group_representatives.detach().cpu().numpy()
         selected_sources = source_indices[final_representatives]
         final_active = int(group_weights.numel())
+        if fixed_target_active is not None and final_active <= fixed_target_active:
+            stop_reason = "fixed_compression_target"
         total_error_value = float(total_error.detach().cpu())
         final_distortion = total_error_value / (
             2.0 * max(float(initial_weights.sum()), 1.0)
@@ -3168,9 +3206,17 @@ class Aggregator(nn.Module):
         final_objective = final_distortion + float(lambda_cost) * final_ratio
         debug = {
             "initial_active_tokens": count,
-            "minimum_active_tokens": min_keep,
+            "minimum_active_tokens": (
+                fixed_target_active if fixed_target_active is not None else min_keep
+            ),
             "max_group_size": max_group_size,
             "lambda_cost": float(lambda_cost),
+            "fixed_compression_ratio": (
+                None
+                if fixed_compression_ratio is None
+                else float(fixed_compression_ratio)
+            ),
+            "fixed_target_active_tokens": fixed_target_active,
             "cost_denominator": float(max_token_count),
             "max_token_count": float(max_token_count),
             "token_count_normalization": "active_tokens / ((F - 1) * P)",
@@ -3181,9 +3227,18 @@ class Aggregator(nn.Module):
             "knee_distortion": float(final_distortion),
             "selected_distortion": float(final_distortion),
             "selected_token_ratio": float(final_ratio),
+            "selected_compression_ratio": float(1.0 - final_active / max(count, 1)),
             "selected_objective": float(final_objective),
-            "selection": "mutual_nearest_neighbor_delta_E_lt_2_lambda",
-            "stopping_rule": "delta_E < 2 * lambda_cost",
+            "selection": (
+                "fixed_compression_ratio"
+                if fixed_target_active is not None
+                else "mutual_nearest_neighbor_delta_E_lt_2_lambda"
+            ),
+            "stopping_rule": (
+                "fixed_compression_ratio"
+                if fixed_target_active is not None
+                else "delta_E < 2 * lambda_cost"
+            ),
             "stop_reason": stop_reason,
             "parallel_rounds": parallel_rounds,
             "mutual_pairs_seen": mutual_pairs_seen,
@@ -3891,6 +3946,9 @@ class Aggregator(nn.Module):
                 lambda_cost=float(lambda_cost),
                 cost_denominator=float(max((num_frames - 1) * patch_count, 1)),
                 prefer_best_parent=True,
+                fixed_compression_ratio=getattr(
+                    self, "frame_fusion_fixed_compression_ratio", None
+                ),
                 merge_top_similarity_percent=float(
                     getattr(self, "frame_fusion_merge_top_similarity_percent", 100.0)
                 ),
@@ -4008,6 +4066,9 @@ class Aggregator(nn.Module):
                 if uses_lambda
                 else None
             ),
+            "fixed_compression_ratio": getattr(
+                self, "frame_fusion_fixed_compression_ratio", None
+            ),
             "merge_top_similarity_percent": float(
                 getattr(self, "frame_fusion_merge_top_similarity_percent", 100.0)
             ),
@@ -4016,14 +4077,20 @@ class Aggregator(nn.Module):
                 for layer, value in getattr(self, "frame_fusion_lambda_cost_by_layer", {}).items()
             },
             "selection": (
-                "mutual_nearest_neighbor_delta_E_lt_2_lambda"
+                "fixed_compression_ratio"
+                if mode == "u-m"
+                and getattr(self, "frame_fusion_fixed_compression_ratio", None) is not None
+                else "mutual_nearest_neighbor_delta_E_lt_2_lambda"
                 if mode == "u-m"
                 else "min(D_m_normalized + lambda_cost * M_m_normalized)"
                 if uses_lambda
                 else "geometric_knee"
             ),
             "stopping_rule": (
-                "delta_E < 2 * lambda_cost"
+                "fixed_compression_ratio"
+                if mode == "u-m"
+                and getattr(self, "frame_fusion_fixed_compression_ratio", None) is not None
+                else "delta_E < 2 * lambda_cost"
                 if mode == "u-m"
                 else "full_curve_selection"
                 if uses_lambda
@@ -4061,7 +4128,13 @@ class Aggregator(nn.Module):
                 else getattr(self, "frame_fusion_representative_update", "parent")
             ),
             "representative_value_aggregation": (
-                "group-mean" if mode == "u-m" else "source-token"
+                "final-representative-token"
+                if mode == "u-m"
+                and getattr(self, "frame_fusion_attention_variant", "representative")
+                == "last-representative"
+                else "group-mean"
+                if mode == "u-m"
+                else "source-token"
             ),
             "attention_only": True,
             "mlp_scope": "full_original_token_sequence",
@@ -4085,6 +4158,33 @@ class Aggregator(nn.Module):
                 for batch_index, plan in enumerate(plans)
             ],
         }
+        if batch_debug:
+            self.last_frame_fusion_debug.update(
+                {
+                    "selected_compression_ratio": float(
+                        sum(
+                            float(item.get("selected_compression_ratio", 0.0))
+                            for item in batch_debug
+                            if item.get("selected_compression_ratio") is not None
+                        )
+                        / max(
+                            sum(
+                                item.get("selected_compression_ratio") is not None
+                                for item in batch_debug
+                            ),
+                            1,
+                        )
+                    ),
+                    "avg_selected_pairs": float(
+                        sum(float(item.get("selected_pairs", 0.0)) for item in batch_debug)
+                        / max(len(batch_debug), 1)
+                    ),
+                    "avg_selected_groups": float(
+                        sum(float(item.get("selected_groups", 0.0)) for item in batch_debug)
+                        / max(len(batch_debug), 1)
+                    ),
+                }
+            )
         self._frame_fusion_plan_seconds = getattr(
             self, "_frame_fusion_plan_seconds", 0.0
         ) + time.perf_counter() - started
@@ -4858,13 +4958,24 @@ class Aggregator(nn.Module):
             frame_tokens = tokens[batch_index]
             special_tokens = frame_tokens[:, :patch_start].reshape(-1, embed_dim)
             patch_tokens = frame_tokens[:, patch_start:].reshape(-1, embed_dim)
-            if self.frame_fusion_mode == "u-m":
+            if (
+                self.frame_fusion_mode == "u-m"
+                and self.frame_fusion_attention_variant != "last-representative"
+            ):
                 # Keep the final U-M partition fixed, but summarize each
                 # group with all of its current tokens instead of one parent.
                 representatives = self._mean_group_representatives(
                     patch_tokens,
                     plan.position_to_representative.to(device=tokens.device).reshape(-1),
                     representative_count=plan.representative_source_indices.numel(),
+                )
+            elif (
+                self.frame_fusion_mode == "u-m"
+                and self.frame_fusion_attention_variant == "last-representative"
+            ):
+                representatives = self._last_group_representatives(
+                    patch_tokens,
+                    plan.representative_source_indices.to(device=tokens.device),
                 )
             else:
                 representatives = patch_tokens.index_select(
@@ -5032,6 +5143,15 @@ class Aggregator(nn.Module):
             minlength=representative_count,
         ).to(device=patch_tokens.device, dtype=patch_tokens.dtype)
         return representative_sums / counts.clamp_min(1).unsqueeze(-1)
+
+    @staticmethod
+    def _last_group_representatives(
+        patch_tokens: torch.Tensor,
+        representative_source_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the final representative source token selected by the merge."""
+
+        return patch_tokens.index_select(0, representative_source_indices)
 
     def _run_adaptive_spatial_representative_global_attention_block(
         self,

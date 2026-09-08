@@ -297,6 +297,15 @@ def parse_args() -> argparse.Namespace:
         help="Lambda for adaptive temporal representative objective D_tilde + lambda*q.",
     )
     parser.add_argument(
+        "--frame-fusion-fixed-compression-ratio",
+        type=float,
+        default=None,
+        help=(
+            "For U-M, replace the delta_E < 2*lambda stopping rule with a fixed "
+            "fraction of non-reference patch tokens to compress, in [0, 1)."
+        ),
+    )
+    parser.add_argument(
         "--frame-fusion-merge-top-similarity-percent",
         type=float,
         default=100.0,
@@ -324,19 +333,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-fusion-time-overlap", type=float, default=0.5)
     parser.add_argument("--frame-fusion-reassignment-candidates", type=int, default=8)
     parser.add_argument(
+        "--max-geometry-points",
+        type=int,
+        default=100_000,
+        help="Maximum corresponding RGB-D points used for point-cloud metrics.",
+    )
+    parser.add_argument(
         "--frame-fusion-representative-update",
         choices=("parent", "exact-medoid"),
         default="parent",
     )
     parser.add_argument(
         "--frame-fusion-attention-variant",
-        choices=("representative", "representative-log", "kv-only", "replicated"),
+        choices=(
+            "representative",
+            "representative-log",
+            "kv-only",
+            "replicated",
+            "last-representative",
+        ),
         default="representative",
         help=(
             "U-M attention variant. 'representative-log' restores log group-size "
             "weights; 'kv-only' keeps all queries and compresses "
             "only keys/values; 'replicated' copies representatives to a full "
-            "length sequence; default preserves the base path."
+            "length sequence; 'last-representative' uses the final representative "
+            "source token selected for each U-M group instead of its mean."
         ),
     )
     parser.add_argument(
@@ -879,6 +901,7 @@ def load_model(
     frame_fusion_recompute_each_global: bool,
     frame_fusion_recompute_layers: str | None,
     frame_fusion_lambda_cost: float,
+    frame_fusion_fixed_compression_ratio: float | None,
     frame_fusion_merge_top_similarity_percent: float,
     frame_fusion_layer_lambdas: str,
     frame_fusion_min_keep_ratio: float,
@@ -952,6 +975,7 @@ def load_model(
         "frame_fusion_recompute_each_global": frame_fusion_recompute_each_global,
         "frame_fusion_recompute_layers": frame_fusion_recompute_layers,
         "frame_fusion_lambda_cost": frame_fusion_lambda_cost,
+        "frame_fusion_fixed_compression_ratio": frame_fusion_fixed_compression_ratio,
         "frame_fusion_merge_top_similarity_percent": frame_fusion_merge_top_similarity_percent,
         "frame_fusion_layer_lambdas": frame_fusion_layer_lambdas,
         "frame_fusion_min_keep_ratio": frame_fusion_min_keep_ratio,
@@ -1141,6 +1165,7 @@ def geometry_from_prediction(
     records: Sequence[FrameRecord],
     min_depth: float,
     max_depth: float,
+    max_geometry_points: int,
 ) -> dict[str, float | int]:
     """Pi3-compatible ACC/Comp/NC metrics for Omega's depth+camera outputs.
 
@@ -1162,7 +1187,12 @@ def geometry_from_prediction(
         np.isfinite(predicted_depth) & (predicted_depth > 0)
         & np.isfinite(gt_depth) & (gt_depth > min_depth) & (gt_depth < max_depth)
     )
-    return evaluate_pi3_geometry(pred_points, gt_points, valid)
+    return evaluate_pi3_geometry(
+        pred_points,
+        gt_points,
+        valid,
+        max_points=max_geometry_points,
+    )
 
 
 def main() -> int:
@@ -1175,6 +1205,8 @@ def main() -> int:
         raise ValueError("--num-frames must be at least 2")
     if args.sampling_stride <= 0:
         raise ValueError("--sampling-stride must be positive")
+    if args.max_geometry_points < 3:
+        raise ValueError("--max-geometry-points must be at least 3")
     resolved_reference_frame_index = resolve_reference_frame_index(
         args.reference_frame_index,
         args.num_frames,
@@ -1197,6 +1229,12 @@ def main() -> int:
         raise ValueError("--merge-ratio must be in [0, 1]")
     if args.frame_fusion_lambda_cost < 0.0:
         raise ValueError("--frame-fusion-lambda-cost must be non-negative")
+    if args.frame_fusion_fixed_compression_ratio is not None and not (
+        0.0 <= args.frame_fusion_fixed_compression_ratio < 1.0
+    ):
+        raise ValueError(
+            "--frame-fusion-fixed-compression-ratio must be in [0, 1)"
+        )
     if not 0.0 < args.frame_fusion_merge_top_similarity_percent <= 100.0:
         raise ValueError(
             "--frame-fusion-merge-top-similarity-percent must be in (0, 100]"
@@ -1447,6 +1485,7 @@ def main() -> int:
         args.frame_fusion_recompute_each_global,
         args.frame_fusion_recompute_layers,
         args.frame_fusion_lambda_cost,
+        args.frame_fusion_fixed_compression_ratio,
         args.frame_fusion_merge_top_similarity_percent,
         args.frame_fusion_layer_lambdas,
         args.frame_fusion_min_keep_ratio,
@@ -1649,7 +1688,12 @@ def main() -> int:
         row.update(trajectory_pose_metrics(np.linalg.inv(pred_w2c), np.linalg.inv(gt_w2c)))
         row.update(
             geometry_from_prediction(
-                predicted_depth, pred_w2c, records, args.min_depth, args.max_depth
+                predicted_depth,
+                pred_w2c,
+                records,
+                args.min_depth,
+                args.max_depth,
+                args.max_geometry_points,
             )
         )
         if model.aggregator.last_frame_fusion_debug:
@@ -1735,6 +1779,12 @@ def main() -> int:
             row["frame_fusion_cost_model"] = debug.get("cost_model")
             row["frame_fusion_lambda_cost"] = debug.get(
                 "lambda_cost", args.frame_fusion_lambda_cost
+            )
+            row["frame_fusion_fixed_compression_ratio"] = debug.get(
+                "fixed_compression_ratio", args.frame_fusion_fixed_compression_ratio
+            )
+            row["frame_fusion_selected_compression_ratio"] = debug.get(
+                "selected_compression_ratio"
             )
             if args.frame_fusion_mode in {
                 "temporal-representative",
@@ -1838,6 +1888,7 @@ def main() -> int:
     for geometry_key in (
         "acc_mean_m", "acc_median_m", "comp_mean_m", "comp_median_m",
         "nc_mean", "nc_median", "chamfer_mean_m", "chamfer_median_m",
+        "f1_at_threshold_percent", "f1_10cm_percent",
     ):
         overall[geometry_key] = float(np.mean([float(row[geometry_key]) for row in per_sequence]))
     result = {
@@ -1875,6 +1926,12 @@ def main() -> int:
             "min_depth_m": args.min_depth,
             "max_depth_m": args.max_depth,
             "prediction_clip_m": [args.min_depth, args.max_depth],
+            "max_geometry_points": args.max_geometry_points,
+            "point_cloud_f1": {
+                "metric": "harmonic_mean_precision_recall",
+                "threshold_m": 0.1,
+                "alignment": "Sim(3)+ICP",
+            },
             "merge_ratio": args.merge_ratio,
             "fastvggt_protect_tokens": not args.fastvggt_disable_protection,
             "frame_fusion": {
@@ -1894,6 +1951,7 @@ def main() -> int:
                 "recompute_each_global": args.frame_fusion_recompute_each_global,
                 "recompute_layers": args.frame_fusion_recompute_layers,
                 "lambda_cost": args.frame_fusion_lambda_cost,
+                "fixed_compression_ratio": args.frame_fusion_fixed_compression_ratio,
                 "merge_top_similarity_percent": args.frame_fusion_merge_top_similarity_percent,
                 "layer_lambdas": args.frame_fusion_layer_lambdas,
                 "min_keep_ratio": args.frame_fusion_min_keep_ratio,

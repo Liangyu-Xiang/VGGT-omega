@@ -1270,6 +1270,33 @@ def test_unified_batch_merge_stops_when_delta_exceeds_lambda_threshold():
     assert debug["stop_reason"] == "minimum_delta_threshold"
 
 
+def test_unified_batch_merge_can_target_a_fixed_compression_ratio():
+    model = Aggregator.__new__(Aggregator)
+    features = torch.tensor(
+        [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]]
+    )
+
+    mapping, selected_sources, debug = model._batch_mutual_nearest_group_merge(
+        features,
+        np.arange(4, dtype=np.int64),
+        np.asarray([0, 2], dtype=np.int64),
+        np.asarray([1, 3], dtype=np.int64),
+        protected=np.zeros(4, dtype=bool),
+        min_keep_ratio=0.05,
+        lambda_cost=0.01,
+        cost_denominator=4.0,
+        fixed_compression_ratio=0.5,
+    )
+
+    assert mapping.tolist() == [0, 0, 1, 1]
+    assert selected_sources.tolist() == [0, 2]
+    assert debug["selection"] == "fixed_compression_ratio"
+    assert debug["stopping_rule"] == "fixed_compression_ratio"
+    assert debug["fixed_target_active_tokens"] == 2
+    assert debug["selected_compression_ratio"] == pytest.approx(0.5)
+    assert debug["stop_reason"] == "fixed_compression_target"
+
+
 def test_unified_batch_merge_does_not_select_filtered_edges_as_mutual_pairs():
     model = Aggregator.__new__(Aggregator)
     features = torch.tensor([[1.0, 0.0], [1.0, 0.0]])
@@ -1338,4 +1365,26 @@ def test_unified_mean_representatives_average_every_token_in_final_group():
     assert torch.allclose(
         representatives,
         torch.tensor([[2.0, 1.0], [2.0, 2.0]]),
+    )
+
+
+def test_unified_last_representatives_keep_the_final_representative_token():
+    patch_tokens = torch.tensor(
+        [
+            [1.0, 0.0],
+            [3.0, 2.0],
+            [-1.0, 4.0],
+            [5.0, 0.0],
+        ]
+    )
+    representative_sources = torch.tensor([1, 3], dtype=torch.long)
+
+    representatives = Aggregator._last_group_representatives(
+        patch_tokens,
+        representative_sources,
+    )
+
+    assert torch.equal(
+        representatives,
+        torch.tensor([[3.0, 2.0], [5.0, 0.0]]),
     )
