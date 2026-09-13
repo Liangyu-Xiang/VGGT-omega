@@ -1,4 +1,4 @@
-"""SelfTR public API.
+"""Public API for the official implementation of the SelfTR paper.
 
 The VGGT implementation remains available under ``vggt_omega`` for checkpoint
 and upstream compatibility.  New code should import :class:`SelfTR` from this

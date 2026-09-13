@@ -1,4 +1,4 @@
-"""Stable public model API for SelfTR."""
+"""Stable public model API for the official SelfTR implementation."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One official evaluation entry point for SelfTR datasets.
+"""Official evaluation entry point for the SelfTR paper implementation.
 
 The dataset adapters deliberately reuse one metric implementation so ScanNet,
 7 Scenes, and NRGBD create the same ``metrics.json``, sampled-frame manifest,

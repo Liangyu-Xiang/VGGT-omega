@@ -1,14 +1,18 @@
 # SelfTR
 
-SelfTR is an inference-time spatiotemporal token-compression method for the
-bundled VGGT-Omega geometry backbone. It replaces the former experimental
-identifier `u-m` with a stable public method identifier, `selftr`, while
-retaining `u-m` as a deprecated compatibility alias.
+> **Official Implementation of the SelfTR paper.**
 
-The release focuses only on the VGGT/Omega path: camera estimation, depth
-prediction, the SelfTR compressor, and reproducible evaluation on ScanNet,
-7 Scenes, and NRGBD. Historical sparse-attention, DA-VGGT, PI3, and analysis
-experiments are not part of the official SelfTR interface.
+This repository is the official implementation of **SelfTR**, an
+inference-time spatiotemporal token-compression method for the bundled
+VGGT-Omega geometry backbone. It replaces the former experimental identifier
+`u-m` with the stable public method identifier `selftr`, while retaining `u-m`
+as a deprecated compatibility alias for existing experiments.
+
+The official release focuses only on the VGGT/Omega path described in the
+paper: camera estimation, depth prediction, the SelfTR compressor, and
+reproducible evaluation on ScanNet, 7 Scenes, and NRGBD. Historical
+sparse-attention, DA-VGGT, PI3, and analysis experiments are not part of the
+official SelfTR implementation.
 
 ## What SelfTR does
 

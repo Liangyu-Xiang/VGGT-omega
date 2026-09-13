@@ -1,7 +1,7 @@
 [project]
 name = "selftr"
 version = "0.1.0"
-description = "SelfTR: spatiotemporal token reorganization for VGGT geometry inference."
+description = "Official implementation of the SelfTR paper for VGGT geometry inference."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
