@@ -16,7 +16,7 @@ from vggt_omega.models.aggregator import (
     _connected_frame_fusion_groups,
     _sequential_frame_fusion_groups,
 )
-from vggt_omega.models.um_triton import fused_um_edge_cost
+from vggt_omega.models.selftr_triton import fused_selftr_edge_cost
 
 
 def test_frame_fusion_partition_finds_low_cost_contiguous_groups():
@@ -236,7 +236,7 @@ def test_tensorized_spacetime_cube_canonical_order_matches_unique_keys():
     assert torch.equal(keys, torch.unique(keys, sorted=True))
 
 
-def test_um_cube_depends_only_on_radius_and_temporal_window():
+def test_selftr_cube_depends_only_on_radius_and_temporal_window():
     aggregator = Aggregator.__new__(Aggregator)
     aggregator._frame_fusion_patch_grid_size = (5, 5)
     aggregator.frame_fusion_spatial_radius = 2
@@ -937,7 +937,7 @@ def test_layer_token_swap_patch_special_and_whole_scopes():
     assert torch.equal(whole_swapped[0, 2], tokens[0, 0])
 
 
-@pytest.mark.parametrize("mode", ("h-m", "h-r", "u-m", "u-r"))
+@pytest.mark.parametrize("mode", ("h-m", "h-r", "selftr", "u-r"))
 def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
     model = Aggregator.__new__(Aggregator)
     model.patch_token_start = 1
@@ -961,7 +961,7 @@ def test_spatiotemporal_representative_modes_protect_frame_zero(mode):
     assert debug["cost_denominator"] == "(F - 1) * P"
     assert debug["selection"] == (
         "mutual_nearest_neighbor_delta_E_lt_2_lambda"
-        if mode == "u-m"
+        if mode == "selftr"
         else "min(D_m_normalized + lambda_cost * M_m_normalized)"
     )
     assert debug["representative_update"] == (
@@ -1016,7 +1016,7 @@ def test_unified_spatiotemporal_graph_excludes_frame_zero(reallocate):
             [[0.0, 0.0], [0.0, 1.0]],
         ]
     ).unsqueeze(0)
-    model.frame_fusion_mode = "u-r" if reallocate else "u-m"
+    model.frame_fusion_mode = "u-r" if reallocate else "selftr"
     plan = model._build_unified_representative_plan(tokens[0], reallocate=reallocate)
 
     frame_zero_representatives = torch.nonzero(
@@ -1137,9 +1137,9 @@ def test_unified_batch_merge_accepts_disjoint_mutual_pairs_in_one_round():
     assert debug["stopping_rule"] == "delta_E < 2 * lambda_cost"
 
 
-def test_fused_um_edge_cost_falls_back_on_cpu():
+def test_fused_selftr_edge_cost_falls_back_on_cpu():
     features = torch.eye(2, dtype=torch.float32)
-    result = fused_um_edge_cost(
+    result = fused_selftr_edge_cost(
         features,
         torch.ones(2),
         torch.arange(2),
@@ -1155,8 +1155,8 @@ def test_fused_um_edge_cost_falls_back_on_cpu():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fused_um_edge_cost_matches_pytorch_reference_on_cuda(monkeypatch):
-    monkeypatch.setenv("VGGT_UM_TRITON", "1")
+def test_fused_selftr_edge_cost_matches_pytorch_reference_on_cuda(monkeypatch):
+    monkeypatch.setenv("SELFTR_TRITON", "1")
     generator = torch.Generator(device="cuda").manual_seed(7)
     group_count = 37
     feature_dim = 1024
@@ -1192,7 +1192,7 @@ def test_fused_um_edge_cost_matches_pytorch_reference_on_cuda(monkeypatch):
     )
     edge_valid = edge_left != edge_right
 
-    actual = fused_um_edge_cost(
+    actual = fused_selftr_edge_cost(
         group_sums,
         group_weights,
         group_representatives,
@@ -1320,7 +1320,7 @@ def test_unified_batch_merge_does_not_select_filtered_edges_as_mutual_pairs():
 def test_unified_debug_uses_frame_count_for_attention_token_statistics():
     model = Aggregator.__new__(Aggregator)
     model.patch_token_start = 1
-    model.frame_fusion_mode = "u-m"
+    model.frame_fusion_mode = "selftr"
     model.frame_fusion_lambda_cost = 0.25
     model.frame_fusion_temporal_window = 1
     model.frame_fusion_spatial_neighborhood = "N8"

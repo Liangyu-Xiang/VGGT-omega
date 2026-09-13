@@ -1,0 +1,27 @@
+{
+  "method": {
+    "id": "selftr",
+    "display_name": "SelfTR",
+    "legacy_aliases": ["u-m"]
+  },
+  "evaluation": {
+    "num_frames": 300,
+    "sampling_unit": "sequence",
+    "sampling_strategy": "uniform",
+    "seed": 42,
+    "image_resolution": 512,
+    "resize_mode": "max_size",
+    "depth_alignment": "per-frame-median",
+    "timing_repeats": 3
+  },
+  "selftr": {
+    "frame_fusion_mode": "selftr",
+    "recompute_layers": [0, 10, 17],
+    "lambda_cost": 0.04,
+    "min_keep_ratio": 0.05,
+    "temporal_window": 4,
+    "spatial_radius": 2,
+    "merge_top_similarity_percent": 100.0,
+    "attention_variant": "representative"
+  }
+}

@@ -1,197 +1,282 @@
-<div align="center">
-<h1>VGGT-&Omega;</h1>
+# SelfTR
 
-<a href="http://vggt-omega.github.io/" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/Project_Page-green" alt="Project Page"></a>
-<a href="https://arxiv.org/abs/2605.15195" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/badge/arXiv-2605.15195-b31b1b" alt="arXiv"></a>
-<a href="https://huggingface.co/spaces/facebook/vggt-omega"><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Demo-blue'></a>
+SelfTR is an inference-time spatiotemporal token-compression method for the
+bundled VGGT-Omega geometry backbone. It replaces the former experimental
+identifier `u-m` with a stable public method identifier, `selftr`, while
+retaining `u-m` as a deprecated compatibility alias.
 
-<p>
-  <span class="author"><a href="https://jytime.github.io/">Jianyuan Wang</a><sup>1,2</sup></span>
-  <span class="author"><a href="https://silent-chen.github.io/">Minghao Chen</a><sup>1</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=FUDsZkEAAAAJ&amp;hl=zh-CN">Shangzhan Zhang</a><sup>1</sup></span>
-  <span class="author"><a href="https://nikitakaraevv.github.io/">Nikita Karaev</a><sup>1</sup></span>
-  <br>
-  <span class="author"><a href="https://demuc.de/">Johannes Schönberger</a><sup>2</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=IJidh-UAAAAJ&amp;hl=fr">Patrick Labatut</a><sup>2</sup></span>
-  <span class="author"><a href="https://scholar.google.com/citations?user=lJ_oh2EAAAAJ&amp;hl=en">Piotr Bojanowski</a><sup>2</sup></span>
-  <span class="author"><a href="https://d-novotny.github.io/">David Novotny</a></span>
-  <br>
-  <span class="author"><a href="https://www.robots.ox.ac.uk/~vedaldi/">Andrea Vedaldi</a><sup>1,2</sup></span>
-  <span class="author"><a href="https://chrirupp.github.io/">Christian Rupprecht</a><sup>1</sup></span>
-</p>
+The release focuses only on the VGGT/Omega path: camera estimation, depth
+prediction, the SelfTR compressor, and reproducible evaluation on ScanNet,
+7 Scenes, and NRGBD. Historical sparse-attention, DA-VGGT, PI3, and analysis
+experiments are not part of the official SelfTR interface.
 
-**<sup>1</sup>[Visual Geometry Group, University of Oxford](https://www.robots.ox.ac.uk/~vgg/)**; **<sup>2</sup>[Meta AI](https://ai.facebook.com/research/)**
-</div>
+## What SelfTR does
 
-## Pretrained models
+VGGT-Omega alternates frame-local and inter-frame attention. SelfTR acts only
+before global inter-frame attention:
 
-Before using the models, please request access to the checkpoints [here](https://huggingface.co/facebook/VGGT-Omega). Once your request is approved, you can download the checkpoints. Please note that access requests are reviewed by an automated process based on the information provided in the request.
+1. Camera and register tokens are always retained; frame 0 patch tokens are
+   kept one-to-one as reference tokens.
+2. For patches in later frames, SelfTR constructs a local candidate graph over
+   a spatial radius `r` and the next `t` frames.
+3. It scores whole-group merges by cosine reconstruction error. Mutually
+   nearest neighboring groups are accepted when their exact error increment
+   satisfies `ΔE < 2λ`.
+4. Each accepted group is represented by the mean of its current tokens for
+   global attention; the attention residual is then restored to every original
+   patch position and the original per-token MLP is run unchanged.
 
-| Model | Resolution | Text alignment | Download |
-| :--- | :--- | :--- | :--- |
-| `VGGT-Omega-1B-512` | 512 | No | [Link](https://huggingface.co/facebook/VGGT-Omega/blob/main/vggt_omega_1b_512.pt) |
-| `VGGT-Omega-1B-256-Text-Alignment` | 256 | Yes | [Link](https://huggingface.co/facebook/VGGT-Omega/blob/main/vggt_omega_1b_256_text.pt) |
+The official 300-frame configuration is in
+[`configs/selftr/reproduction_300.json`](configs/selftr/reproduction_300.json):
+`λ=0.04`, `r=2`, `t=4`, 5% minimum retained patches, and plan refreshes after
+layers 0, 10, and 17.
 
-The authors are not involved in the review process and cannot approve or reject individual applications. However, the [🤗 Hugging Face demo](https://huggingface.co/spaces/facebook/vggt-omega) is available to everyone.
+## Repository layout
 
+```text
+selftr/                         Public API, identity, checkpoint checks, metrics
+  identity.py                    Single source of truth for the method name
+  config.py                      Typed SelfTR compression configuration
+  model.py                       SelfTR model class and checkpoint loader
+  evaluation/geometry.py         Portable depth, pose, and geometry metrics
+vggt_omega/                     Bundled VGGT-Omega backbone (checkpoint compatible)
+configs/selftr/                 Official immutable reproduction settings
+scripts/eval_selftr.py          Single entry point for all three datasets
+scripts/eval_{7scenes,scannet,nrgbd}_paper.py
+tests/                          Unit tests for compression and public identity
+```
 
-## Quick Start
+## Environment
 
-First, clone this repository and install the dependencies:
+The validated runtime is Linux, Python 3.10+, an NVIDIA GPU with CUDA support,
+and PyTorch 2.3 or newer. A 24 GB GPU can run shorter sequences; the complete
+300-frame protocol should be run on a GPU with at least 40 GB free memory. The
+historical reference runs used an RTX 4090 with 48 GB.
+
+Create an isolated environment and install PyTorch appropriate for the local
+CUDA driver. The example below uses CUDA 12.1 wheels; replace `cu121` when
+needed according to the [PyTorch installation selector](https://pytorch.org/get-started/locally/).
 
 ```bash
-git clone git@github.com:facebookresearch/vggt-omega.git
-cd vggt-omega
+conda create -n selftr python=3.10 -y
+conda activate selftr
+
+pip install --index-url https://download.pytorch.org/whl/cu121 \
+  torch==2.3.1 torchvision==0.18.1
 pip install -r requirements.txt
 pip install -e .
 ```
 
+`triton` is optional. When it is available, SelfTR uses a fused CUDA edge-cost
+kernel. The numerically equivalent PyTorch implementation is selected when it
+is absent or when `SELFTR_TRITON=0`.
 
-Now, try the model with a few lines of code:
+Verify the installation before downloading or processing a dataset:
+
+```bash
+python -m compileall -q selftr vggt_omega scripts
+python -m pytest -q tests/test_selftr_identity.py tests/test_frame_fusion_partition.py
+python scripts/eval_selftr.py --dataset 7scenes --help
+```
+
+## Checkpoints
+
+SelfTR changes no learned parameters, so it uses the corresponding
+**VGGT-Omega** checkpoint directly. Store the checkpoint outside Git, for
+example:
+
+```text
+pretrained_ckpts/selftr_vggt_omega_1b_512.pt
+```
+
+Inspect it before an expensive evaluation:
+
+```bash
+python -c "from selftr import inspect_checkpoint; print(inspect_checkpoint('pretrained_ckpts/selftr_vggt_omega_1b_512.pt'))"
+```
+
+### Important: supplied VGGT checkpoint
+
+The supplied file
+`/data_SSD1/mmc_lyxiang/3D/vggt/ckpt/model.pt` was inspected during this
+cleanup. It is an **official VGGT** checkpoint with
+`aggregator.global_blocks`, 14-pixel patches, and four register tokens. This
+release applies SelfTR to the bundled **VGGT-Omega** implementation, whose
+state dictionary uses `aggregator.inter_frame_blocks`; the two architectures
+are not load-compatible. The loader now detects this before allocating a
+5 GB model and explains the mismatch.
+
+Therefore, use a matching VGGT-Omega checkpoint to reproduce the SelfTR
+results below. The supplied file is still useful for verifying that the
+checkpoint diagnostic works:
+
+```bash
+python -c "from selftr import inspect_checkpoint; print(inspect_checkpoint('/data_SSD1/mmc_lyxiang/3D/vggt/ckpt/model.pt'))"
+```
+
+It should report `family='official-vggt'`. Do not use `strict=False` or rename
+state-dict keys to force this checkpoint into SelfTR: that would silently
+change the model being evaluated.
+
+## Python inference
 
 ```python
 import torch
 
-from vggt_omega.models import VGGTOmega
+from selftr import SelfTR, SelfTRConfig
 from vggt_omega.utils.load_fn import load_and_preprocess_images
-from vggt_omega.utils.pose_enc import encoding_to_camera
 
-checkpoint_path = "path/to/vggt_omega_1b_512.pt"
-image_names = ["path/to/imageA.png", "path/to/imageB.png", "path/to/imageC.png"]
-
-model = VGGTOmega().to("cuda").eval()
-model.load_state_dict(torch.load(checkpoint_path, map_location="cpu"))
-
-images = load_and_preprocess_images(image_names, image_resolution=512).to("cuda")
-
-with torch.inference_mode():
-    predictions = model(images)
-
-extrinsics, intrinsics = encoding_to_camera(
-    predictions["pose_enc"],
-    predictions["images"].shape[-2:],
+config = SelfTRConfig(
+    recompute_layers=(0, 10, 17),
+    lambda_cost=0.04,
+    temporal_window=4,
+    spatial_radius=2,
 )
+model = SelfTR.from_checkpoint(
+    "pretrained_ckpts/selftr_vggt_omega_1b_512.pt",
+    device="cuda",
+    **config.model_kwargs(),
+)
+images = load_and_preprocess_images(
+    ["frame_000.png", "frame_001.png"], image_resolution=512, mode="max_size"
+).to("cuda")
+with torch.inference_mode():
+    prediction = model(images)
 
-depth = predictions["depth"]
-depth_conf = predictions["depth_conf"]
-camera_and_register_tokens = predictions["camera_and_register_tokens"]
-camera_tokens = camera_and_register_tokens[:, :, :1]
-registers = camera_and_register_tokens[:, :, 1:]
+depth = prediction["depth"]
+pose_encoding = prediction["pose_enc"]
 ```
 
-For the text-aligned checkpoint, use `VGGTOmega(enable_alignment=True)` with `image_resolution=256` and read `predictions["text_alignment_embedding"]`.
+## Dataset preparation
 
+Keep data outside the repository. Every command below accepts an explicit
+`--data-root`, so no server-specific absolute path is required.
 
-## Interactive Demo
+| Dataset | Required layout | Notes |
+| --- | --- | --- |
+| 7 Scenes | `<root>/<scene>/TestSplit.txt`, `<root>/<scene>/seq-NN/frame-XXXXXX.color.png`, matching `.pose.txt`, and `.depth.png` or `.depth.proj.png` | RGB-registered `*.depth.proj.png` is preferred. Raw depth is supported as a fallback. |
+| ScanNet | `<root>/sceneXXXX_YY/color/*.jpg`, `depth/*.png`, `pose/*.txt`, `intrinsic/intrinsic_color.txt` | The evaluator accepts every valid scene directory under the root. Depth uses ScanNet's millimetre scale. |
+| NRGBD | `<root>/<sequence>/images/imgN.png`, `depth/depthN.png`, and `poses.txt` | `poses.txt` must contain one 4×4 pose per image. The loader converts the stored OpenGL camera convention to OpenCV. |
 
-Install the demo dependencies:
+The 7 Scenes evaluator uses the official test lists. ScanNet and NRGBD use
+all valid sequence directories found under the supplied root; specify
+`--sequences ...` to evaluate a fixed subset. All evaluators skip invalid pose
+or missing RGB/depth tuples and write the exact selected frame IDs to
+`sampled_frames.json`.
+
+Validate file discovery without loading a model:
 
 ```bash
-pip install -r requirements_demo.txt
+python scripts/eval_selftr.py --dataset 7scenes \
+  --data-root /datasets/7scenes --dry-run
+python scripts/eval_selftr.py --dataset scannet \
+  --data-root /datasets/scannet --dry-run
+python scripts/eval_selftr.py --dataset nrgbd \
+  --data-root /datasets/nrgbd --dry-run
 ```
 
-Launch the Gradio demo with a local checkpoint path:
+## Reproducing the 300-frame protocol
+
+`scripts/eval_selftr.py` is the official entry point. Unless overridden, it
+applies the configuration in `configs/selftr/reproduction_300.json`:
+
+- 300 frames per sequence, first/last-preserving uniform sampling, seed 42;
+- 512-pixel `max_size` preprocessing and per-frame median depth alignment;
+- three CUDA-event timing repeats;
+- `--frame-fusion-mode selftr`, no FastVGGT merge, and the SelfTR parameters
+  listed above.
+
+Run one dataset at a time on an otherwise idle GPU:
 
 ```bash
-python demo_gradio.py \
-  --checkpoint checkpoints/VGGT-Omega-1B-512/model.pt \
-  --image-resolution 512
+CHECKPOINT=/checkpoints/selftr_vggt_omega_1b_512.pt
+
+python scripts/eval_selftr.py --dataset 7scenes \
+  --data-root /datasets/7scenes --checkpoint "$CHECKPOINT" \
+  --device cuda:0 --output-dir outputs/selftr_300/7scenes
+
+python scripts/eval_selftr.py --dataset scannet \
+  --data-root /datasets/scannet --checkpoint "$CHECKPOINT" \
+  --device cuda:0 --output-dir outputs/selftr_300/scannet
+
+python scripts/eval_selftr.py --dataset nrgbd \
+  --data-root /datasets/nrgbd --checkpoint "$CHECKPOINT" \
+  --device cuda:0 --output-dir outputs/selftr_300/nrgbd
 ```
 
-The demo accepts uploaded images or a video, runs camera and depth inference,
-and visualizes the depth-unprojected point cloud and predicted cameras as a GLB
-scene.
-
-## Runtime and GPU Memory
-
-We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a
-single NVIDIA A100 GPU with 624x416 input images. The measurement covers the full
-inference program, from loading the model weights onto the GPU through the
-forward pass, so it includes both the memory needed to store the model itself
-and the memory used by inference activations and buffers. In other words, a GPU
-with at least the listed available memory is able to run the corresponding
-number of input frames under this setup.
-
-| **Input Frames** | 1 | 10 | 25 | 50 | 100 | 200 | 300 | 400 | 500 |
-|:----------------:|:-:|:--:|:--:|:--:|:---:|:---:|:---:|:---:|:---:|
-| **Peak Memory (GB)** | 6.02 | 6.67 | 7.80 | 9.66 | 13.37 | 20.82 | 28.26 | 35.71 | 43.15 |
-
-The benchmark uses [`load_and_preprocess_images`](./vggt_omega/utils/load_fn.py)
-with the default `mode="balanced"` and `image_resolution=512`. For these roughly
-3:2 landscape images, this produces 624x416 inputs. You can set
-`mode="max_size"` to resize the longest side to 512 instead; for the same aspect
-ratio, this gives about 512x336 inputs and uses less GPU memory.
-
-## TUM-Dynamics evaluation
-
-Run the default evaluation protocol (first/last-preserving uniform frame
-sampling, pairwise camera AUC@3/AUC@30, depth delta1.25/AbsRel):
+For a short smoke evaluation, override the protocol explicitly; this must not
+be compared with the 300-frame reference numbers:
 
 ```bash
-conda activate 3d
-python scripts/eval_tum_dynamics_paper.py \
-  --output-dir outputs/tum_dynamics_paper_reproduction
+python scripts/eval_selftr.py --dataset 7scenes \
+  --data-root /datasets/7scenes --checkpoint "$CHECKPOINT" \
+  --sequences chess/seq-03 --num-frames 10 --timing-repeats 1 \
+  --device cuda:0 --output-dir outputs/smoke_7scenes
 ```
 
-By default, the evaluation scripts read the dataset from `data/TUM-Dynamics`
-and the checkpoint from `pretrained_ckpts/vggt_omega_1b_512.pt`. These paths are
-intended to be local symlinks because datasets and checkpoints are not tracked
-by Git.
+Each output directory contains:
 
-The paper reports 30.2/82.3 for AUC@3/AUC@30 and 97.4/0.041 for
-delta1.25/AbsRel with the 1B model. The release does not include its sampled
-frame IDs. Pass `--sampling-strategy random` to run the older seeded-random
-loader convention. Every run writes the exact selection to `sampled_frames.json`,
-metrics to `metrics.json`, and raw pose errors to `pose_errors.npz`.
+- `sampled_frames.json`: the exact input files and sampled indices;
+- `metrics.json`: method name/ID, complete protocol, aggregate metrics, and
+  per-sequence metrics;
+- `pose_errors.npz`: all pairwise rotation and translation errors.
 
-For long-sequence inputs, pass `--num-frames 500`. The default sampler preserves
-the first and last frame in each raw sequence pool and selects the middle frames
-with deterministic `linspace` spacing.
+The geometry metrics are deterministic Pi3-compatible metrics: corresponding
+depth point maps are Sim(3)-aligned, refined with point-to-point ICP, then
+scored by bidirectional nearest-neighbor accuracy/completeness and normal
+consistency. The evaluator records the fixed 100,000-point budget.
 
-For the separate 90-frame trajectory protocol (not the metrics in the paper's
-Tables 1 and 2), use `scripts/eval_tum_dynamics.py`. It reports Sim(3)-aligned
-ATE and frame-to-frame translation/rotation RPE.
+## Reference results
 
-To run the inference-only shallow Register-Attention ablation on the same split,
-use `--attention-mode register-only-zero-shot`. This changes the released
-checkpoint so layers 0-8 use Register Attention while layers 9-23 keep global
-inter-frame attention. Pass `--register-only-global-layers none` to recover the
-older all-register inference-time ablation. It is not equivalent to the
-separately trained all-Register model discussed in the paper, whose checkpoint
-was not released. Each result includes CUDA-event model latency and peak GPU
-memory measurements.
+The following archived SelfTR runs use the 300-frame protocol above, a
+compatible VGGT-Omega checkpoint, and the all-sequence sets visible to the
+original runs (18 7 Scenes sequences, 30 ScanNet scenes, and 9 NRGBD
+sequences). Values can vary slightly across CUDA, PyTorch, and Open3D
+versions; compare the saved protocol and `sampled_frames.json` before treating
+a difference as a model change.
 
-Reproduce the paper's motion-awareness visualization by clustering
-PCA-reduced intermediate patch tokens over space and time:
+| Dataset | AUC@3 ↑ | AUC@30 ↑ | δ1.25 ↑ | AbsRel ↓ | Mean latency (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 7 Scenes | 31.07 | 87.52 | 94.49 | 0.0566 | 11,763 |
+| ScanNet | 16.64 | 83.70 | 98.44 | 0.0308 | 19,604 |
+| NRGBD | 85.51 | 98.07 | 99.59 | 0.0086 | 10,563 |
+
+The row values are reported only for the stated protocol. Changing frame
+count, input resize mode, sampled frames, depth alignment, or checkpoint is a
+different experiment and must be reported separately.
+
+## Renaming the method
+
+The official display name has one source of truth:
+[`selftr/identity.py`](selftr/identity.py).
+
+Change `DEFAULT_METHOD_NAME` to permanently rename the method in future code
+and artifacts, while keeping the stable machine identifier `selftr`. For a
+single run or a paper variant, use either of the following without editing
+code:
 
 ```bash
-python scripts/visualize_motion_awareness.py \
-  --sequence rgbd_dataset_freiburg3_walking_static \
-  --layers 4 13 23 \
-  --output-dir outputs/motion_awareness_walking_static
+SELFTR_METHOD_NAME="My New Method" python scripts/eval_selftr.py --dataset 7scenes ...
+python scripts/eval_selftr.py --dataset 7scenes --method-name "My New Method" ...
 ```
 
-The script maps each patch-token label back to its 16x16 pixel region and
-writes paper-style red overlays, all-cluster views, MP4 videos, raw patch
-labels, pixel masks, cluster statistics, and an independent red-overlay video
-for every cluster. Layer 4 is generally the cleanest motion/person response on
-this sequence.
+`u-m`, `u_m`, and `um` remain accepted only as deprecated aliases. New
+commands, configuration files, and result tables should use `selftr` and the
+chosen display name.
 
-## License
+## Reproducibility checklist
 
-See the [LICENSE](./LICENSE) file for details about the license under which
-this code is made available.
+Before publishing a comparison, retain all of the following with the output
+directory:
 
-[^release]: This Release is intended to support the open source research community.
+1. Git commit ID and `pip freeze` output.
+2. Checkpoint filename and cryptographic hash (do not commit the checkpoint).
+3. GPU model, driver, CUDA, PyTorch, Triton, and Open3D versions.
+4. The unmodified `metrics.json`, `sampled_frames.json`, and `pose_errors.npz`.
+5. The complete command line, including any `--sequences` subset.
 
-```bibtex
-@misc{wang2026vggtomega,
-      title={VGGT-$\Omega$}, 
-      author={Jianyuan Wang and Minghao Chen and Shangzhan Zhang and Nikita Karaev and Johannes Schönberger and Patrick Labatut and Piotr Bojanowski and David Novotny and Andrea Vedaldi and Christian Rupprecht},
-      year={2026},
-      eprint={2605.15195},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2605.15195}, 
-}
-```
+## License and upstream components
+
+See [`LICENSE`](LICENSE). The bundled VGGT-Omega backbone remains in
+`vggt_omega/` to preserve upstream checkpoint compatibility; SelfTR-specific
+public code lives under `selftr/`.

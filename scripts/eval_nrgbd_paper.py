@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""VGGT-Omega NRGBD evaluation using the standard 7Scenes metric protocol."""
+"""SelfTR NRGBD evaluation using the standard 7 Scenes metric protocol."""
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
 import numpy as np
 from PIL import Image
 import eval_7scenes_paper as base
 
-DEFAULT_ROOT = Path("/data/mmc_syang/dataset/NRGBD")
+DEFAULT_ROOT = Path(os.environ.get("SELFTR_NRGBD_ROOT", "data/nrgbd"))
 
 def select_sequence_dirs(data_root: Path, requested: list[str] | None) -> list[Path]:
     dirs = sorted(path for path in data_root.iterdir() if (path / "images").is_dir() and (path / "depth").is_dir() and (path / "poses.txt").is_file())
@@ -43,6 +44,9 @@ def read_resized_depth(path: Path, height: int, width: int) -> np.ndarray:
 base.select_sequence_dirs = select_sequence_dirs
 base.load_frame_records = load_frame_records
 base.read_resized_depth = read_resized_depth
+base.DATASET_NAME = "NRGBD"
+base.DATASET_SPLIT = "all valid sequence directories under --data-root"
+base.PAPER_TARGETS = {}
 
 if __name__ == "__main__":
     if "--data-root" not in sys.argv:

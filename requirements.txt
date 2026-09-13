@@ -5,3 +5,5 @@ Pillow
 einops
 safetensors
 opencv-python
+scipy
+open3d>=0.18

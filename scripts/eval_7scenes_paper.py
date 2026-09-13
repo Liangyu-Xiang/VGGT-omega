@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate VGGT-Omega on 7 Scenes.
+"""Evaluate SelfTR or its VGGT backbone on 7 Scenes.
 
 The VGGT-Omega paper samples 10 frames per scene/sequence and reports pairwise
 relative-pose AUC plus scale-aligned depth metrics.  The paper does not publish
@@ -32,13 +32,16 @@ from PIL import Image
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-SHARED_ROOT = Path("/data/mmc_syang")
-if str(SHARED_ROOT) not in sys.path:
-    sys.path.insert(0, str(SHARED_ROOT))
-
-from geometry_eval import depth_error_metrics, depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics, trajectory_pose_metrics
-
-from vggt_omega.models import VGGTOmega
+from selftr import SelfTR
+from selftr.checkpoint import load_state_dict, require_selftr_checkpoint
+from selftr.evaluation import (
+    depth_error_metrics,
+    depth_to_world_points,
+    evaluate_pi3_geometry,
+    scaled_intrinsics,
+    trajectory_pose_metrics,
+)
+from selftr.identity import METHOD_ID, canonical_frame_fusion_mode, resolve_method_name
 from vggt_omega.utils.frame_sampling import SAMPLING_STRATEGIES, uniform_first_last_indices
 from vggt_omega.utils.gpu_guard import assert_exclusive_gpu
 from vggt_omega.utils.load_fn import load_and_preprocess_images
@@ -51,7 +54,7 @@ from vggt_omega.utils.reference_frame import (
 )
 
 
-DEFAULT_DATA_ROOT = Path("/data/mmc_lyxiang/dataset/7scenes")
+DEFAULT_DATA_ROOT = Path(os.environ.get("SELFTR_7SCENES_ROOT", "data/7scenes"))
 DEFAULT_CHECKPOINT = REPO_ROOT / "pretrained_ckpts" / "vggt_omega_1b_512.pt"
 SCENES = ("chess", "fire", "heads", "office", "pumpkin", "redkitchen", "stairs")
 DEFAULT_REGISTER_ONLY_GLOBAL_LAYER_SPEC = "9-23"
@@ -61,6 +64,8 @@ PAPER_TARGETS = {
     "delta_1_25_percent": 94.6,
     "abs_rel": 0.058,
 }
+DATASET_NAME = "7Scenes"
+DATASET_SPLIT = "official TestSplit.txt files"
 
 
 @dataclass(frozen=True)
@@ -90,16 +95,21 @@ def process_token_retention_percent(layer_stats: list[dict], global_layer_count:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Reproduce VGGT-Omega Table 1/2 metrics on 7 Scenes."
+        description="Reproduce SelfTR and VGGT-backbone metrics on 7 Scenes."
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/7scenes_paper"))
     parser.add_argument(
         "--acceleration-method",
-        choices=("none", "da-vggt", "sparse-vggt", "fastvggt", "u-m"),
+        choices=("none", "da-vggt", "sparse-vggt", "fastvggt", "selftr", "u-m"),
         default="none",
         help="Unified interface label; DA-VGGT enables anchor-chunk inference.",
+    )
+    parser.add_argument(
+        "--method-name",
+        default=None,
+        help="Display name stored in metrics.json (default: SELFTR_METHOD_NAME or SelfTR).",
     )
     parser.add_argument(
         "--da-chunk-size", type=int, default=50,
@@ -188,7 +198,8 @@ def parse_args() -> argparse.Namespace:
             "adaptive-spatial-representative",
             "h-m",
             "h-r",
-            "u-m",
+            "selftr",
+            "u-m",  # Deprecated alias, normalized to "selftr" after parsing.
             "u-r",
         ),
         default="none",
@@ -278,15 +289,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Recompute the frame-fusion plan after every frame-attention block "
             "immediately before each global inter-frame attention block. "
-            "Supported by pair-top-percent and U-M/H-M/U-R/H-R representative fusion."
+            "Supported by pair-top-percent and SelfTR/H-M/U-R/H-R representative fusion."
         ),
     )
     parser.add_argument(
         "--frame-fusion-recompute-layers",
         default=None,
         help=(
-            "Comma-separated global layer indices at which to rebuild the U-M/H-M "
-            "representative plan after frame attention. U-M defaults to '0,10,17'; "
+            "Comma-separated global layer indices at which to rebuild the SelfTR/H-M "
+            "representative plan after frame attention. SelfTR defaults to '0,10,17'; "
             "pass 'none' to disable refreshes."
         ),
     )
@@ -318,7 +329,7 @@ def parse_args() -> argparse.Namespace:
         "--frame-fusion-layer-lambdas",
         default="",
         help=(
-            "Optional per-recompute-layer U-M lambdas, as '0:0.1,10:0.1,17:0.1' "
+            "Optional per-recompute-layer SelfTR lambdas, as '0:0.1,10:0.1,17:0.1' "
             "or three comma-separated values in recompute-layer order."
         ),
     )
@@ -354,7 +365,7 @@ def parse_args() -> argparse.Namespace:
         ),
         default="representative",
         help=(
-            "U-M attention variant. 'representative-log' restores log group-size "
+            "SelfTR attention variant. 'representative-log' restores log group-size "
             "weights; 'kv-only' keeps all queries and compresses "
             "only keys/values; 'replicated' copies representatives to a full "
             "length sequence; 'last-representative' uses the final representative "
@@ -883,6 +894,7 @@ def sample_records(
 def load_model(
     checkpoint: Path,
     device: torch.device,
+    method_name: str,
     merge_ratio: float,
     first_frame_token_indices: tuple[int, ...],
     frame_fusion_mode: str,
@@ -950,9 +962,10 @@ def load_model(
     adaptive_anchor_debug: bool,
     adaptive_anchor_debug_dir: Path,
     fastvggt_protect_tokens: bool = True,
-) -> VGGTOmega:
+) -> SelfTR:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
+    require_selftr_checkpoint(checkpoint)
     # Pass the ratio explicitly because local FastVGGT experiments may change
     # the model constructor's default.  Zero is the unmodified paper model.
     model_kwargs = {
@@ -1026,7 +1039,7 @@ def load_model(
         "adaptive_anchor_debug": adaptive_anchor_debug,
         "adaptive_anchor_debug_dir": adaptive_anchor_debug_dir,
     }
-    signature = inspect.signature(VGGTOmega)
+    signature = inspect.signature(SelfTR)
     accepts_extra_kwargs = any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
@@ -1039,26 +1052,18 @@ def load_model(
     elif use_adaptive_kv_anchor:
         missing = ", ".join(unsupported_adaptive_kwargs)
         raise RuntimeError(
-            "This VGGTOmega build does not support adaptive K/V anchor parameters "
-            f"({missing}). Update vggt_omega.models.VGGTOmega before running with "
+            "This SelfTR/VGGT build does not support adaptive K/V anchor parameters "
+            f"({missing}). Update the bundled VGGT backbone before running with "
             "--use-adaptive-kv-anchor."
         )
-    model = VGGTOmega(**model_kwargs)
-    kwargs = {"map_location": "cpu", "weights_only": True}
-    try:
-        state = torch.load(checkpoint, mmap=True, **kwargs)
-    except TypeError:
-        state = torch.load(checkpoint, **kwargs)
-    if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
-        state = state["model"]
-    if state and all(key.startswith("module.") for key in state):
-        state = {key.removeprefix("module."): value for key, value in state.items()}
+    model = SelfTR(method_name=method_name, **model_kwargs)
+    state = load_state_dict(checkpoint)
     model.load_state_dict(state, strict=True)
     del state
     return model.to(device).eval()
 
 
-def da_forward(model: VGGTOmega, images: torch.Tensor, chunk_size: int) -> dict[str, torch.Tensor]:
+def da_forward(model: SelfTR, images: torch.Tensor, chunk_size: int) -> dict[str, torch.Tensor]:
     """Full DA-VGGT: cached visual tokens and pose-weighted re-chunking."""
     return model.forward_da_vggt(images, chunk_size=chunk_size)
 
@@ -1197,9 +1202,12 @@ def geometry_from_prediction(
 
 def main() -> int:
     args = parse_args()
+    args.method_name = resolve_method_name(args.method_name)
+    args.frame_fusion_mode = canonical_frame_fusion_mode(args.frame_fusion_mode)
+    args.acceleration_method = canonical_frame_fusion_mode(args.acceleration_method)
     if args.frame_fusion_recompute_layers is None:
         args.frame_fusion_recompute_layers = (
-            "0,10,17" if args.frame_fusion_mode == "u-m" else ""
+            "0,10,17" if args.frame_fusion_mode == "selftr" else ""
         )
     if args.num_frames < 2:
         raise ValueError("--num-frames must be at least 2")
@@ -1272,7 +1280,7 @@ def main() -> int:
         "adaptive-spatial-representative",
         "h-m",
         "h-r",
-        "u-m",
+        "selftr",
         "u-r",
     }:
         if not 0.0 < args.frame_fusion_pair_percent <= 100.0:
@@ -1296,7 +1304,7 @@ def main() -> int:
         "pair-top-percent",
         "h-m",
         "h-r",
-        "u-m",
+        "selftr",
         "u-r",
     }:
         raise ValueError(
@@ -1467,6 +1475,7 @@ def main() -> int:
     model = load_model(
         args.checkpoint,
         device,
+        args.method_name,
         args.merge_ratio,
         first_frame_token_indices,
         args.frame_fusion_mode,
@@ -1792,7 +1801,7 @@ def main() -> int:
                 "adaptive-spatial-representative",
                 "h-m",
                 "h-r",
-                "u-m",
+                "selftr",
                 "u-r",
             }:
                 first_batch = (debug.get("batches") or [{}])[0]
@@ -1830,7 +1839,7 @@ def main() -> int:
             "retention_vs_fastvggt_input"
         )
         row["fastvggt_actual_layers"] = fastvggt_debug.get("layers")
-        if args.frame_fusion_mode == "u-m":
+        if args.frame_fusion_mode == "selftr":
             active_ratio = process_token_retention_percent(row.get("frame_fusion_layer_retention", []))
         elif args.acceleration_method == "fastvggt" or args.merge_ratio > 0:
             raw_ratio = row.get("fastvggt_actual_retention_vs_input")
@@ -1892,8 +1901,14 @@ def main() -> int:
     ):
         overall[geometry_key] = float(np.mean([float(row[geometry_key]) for row in per_sequence]))
     result = {
+        "method": {
+            "display_name": args.method_name,
+            "id": METHOD_ID if args.frame_fusion_mode == METHOD_ID else args.acceleration_method,
+            "frame_fusion_mode": args.frame_fusion_mode,
+        },
         "protocol": {
-            "dataset_split": "official TestSplit.txt files",
+            "dataset": DATASET_NAME,
+            "dataset_split": DATASET_SPLIT,
             "sampling_unit": args.sampling_unit,
             "sampling_strategy": args.sampling_strategy,
             "seed": args.seed,
@@ -1959,12 +1974,12 @@ def main() -> int:
                 "spatial_radius": args.frame_fusion_spatial_radius,
                 "candidate_topology": (
                     "spatiotemporal_cube_by_radius_and_window"
-                    if args.frame_fusion_mode == "u-m"
+                    if args.frame_fusion_mode == "selftr"
                     else "legacy_spatial_neighborhood"
                 ),
                 "spatial_neighborhood": (
                     None
-                    if args.frame_fusion_mode == "u-m"
+                    if args.frame_fusion_mode == "selftr"
                     else args.frame_fusion_spatial_neighborhood
                 ),
                 "time_overlap": args.frame_fusion_time_overlap,
@@ -2042,14 +2057,20 @@ def main() -> int:
         translation_error_deg=translation_errors,
     )
 
-    print("\nPaper reproduction result (Ours-1B target in parentheses):")
-    print(f"  AUC@3:     {overall['auc_3_percent']:.2f} ({PAPER_TARGETS['auc_3_percent']:.1f})")
-    print(f"  AUC@30:    {overall['auc_30_percent']:.2f} ({PAPER_TARGETS['auc_30_percent']:.1f})")
-    print(
-        f"  delta1.25: {overall['delta_1_25_percent']:.2f} "
-        f"({PAPER_TARGETS['delta_1_25_percent']:.1f})"
-    )
-    print(f"  AbsRel:    {overall['abs_rel']:.4f} ({PAPER_TARGETS['abs_rel']:.3f})")
+    print(f"\n{DATASET_NAME} evaluation result:")
+    if PAPER_TARGETS:
+        print(f"  AUC@3:     {overall['auc_3_percent']:.2f} ({PAPER_TARGETS['auc_3_percent']:.1f})")
+        print(f"  AUC@30:    {overall['auc_30_percent']:.2f} ({PAPER_TARGETS['auc_30_percent']:.1f})")
+        print(
+            f"  delta1.25: {overall['delta_1_25_percent']:.2f} "
+            f"({PAPER_TARGETS['delta_1_25_percent']:.1f})"
+        )
+        print(f"  AbsRel:    {overall['abs_rel']:.4f} ({PAPER_TARGETS['abs_rel']:.3f})")
+    else:
+        print(f"  AUC@3:     {overall['auc_3_percent']:.2f}")
+        print(f"  AUC@30:    {overall['auc_30_percent']:.2f}")
+        print(f"  delta1.25: {overall['delta_1_25_percent']:.2f}")
+        print(f"  AbsRel:    {overall['abs_rel']:.4f}")
     print(f"Saved reproducible results to {args.output_dir.resolve()}")
     return 0
 

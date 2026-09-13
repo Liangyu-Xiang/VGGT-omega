@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
-"""VGGT-Omega ScanNet evaluation with ScanNet RGB calibration."""
+"""SelfTR ScanNet evaluation with ScanNet RGB calibration."""
 from __future__ import annotations
+import os
 import sys
 from pathlib import Path
 import numpy as np
 from PIL import Image
-import eval_7scenes_paper as base
-from geometry_eval import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
 
-DEFAULT_ROOT = Path("/data/mmc_syang/dataset/scannet30/raw")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import eval_7scenes_paper as base
+from selftr.evaluation import depth_to_world_points, evaluate_pi3_geometry, scaled_intrinsics
+
+DEFAULT_ROOT = Path(os.environ.get("SELFTR_SCANNET_ROOT", "data/scannet"))
 
 def select_sequence_dirs(data_root: Path, requested: list[str] | None) -> list[Path]:
-    dirs = sorted(path for path in data_root.iterdir() if (path / ".complete").is_file() and (path / "color").is_dir() and (path / "depth").is_dir() and (path / "pose").is_dir() and (path / "intrinsic" / "intrinsic_color.txt").is_file())
+    dirs = sorted(
+        path for path in data_root.iterdir()
+        if (path / "color").is_dir()
+        and (path / "depth").is_dir()
+        and (path / "pose").is_dir()
+        and (path / "intrinsic" / "intrinsic_color.txt").is_file()
+    )
     if requested:
         lookup = {path.name: path for path in dirs}
         missing = sorted(set(requested) - set(lookup))
@@ -52,6 +64,9 @@ base.select_sequence_dirs = select_sequence_dirs
 base.load_frame_records = load_frame_records
 base.read_resized_depth = read_resized_depth
 base.geometry_from_prediction = geometry_from_prediction
+base.DATASET_NAME = "ScanNet"
+base.DATASET_SPLIT = "all valid scene directories under --data-root"
+base.PAPER_TARGETS = {}
 
 if __name__ == "__main__":
     if "--data-root" not in sys.argv:

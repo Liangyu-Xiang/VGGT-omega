@@ -1,19 +1,21 @@
 [project]
-name = "vggt-omega"
-version = "0.0.1"
-description = "VGGT-Omega feed-forward camera and depth reconstruction."
+name = "selftr"
+version = "0.1.0"
+description = "SelfTR: spatiotemporal token reorganization for VGGT geometry inference."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-authors = [
-    {name = "Jianyuan Wang", email = "jianyuan@robots.ox.ac.uk"},
-]
+authors = [{name = "SelfTR contributors"}]
 dependencies = [
+    "torch>=2.3",
+    "torchvision>=0.18",
     "numpy<2",
     "Pillow",
     "einops",
     "safetensors",
     "opencv-python",
+    "scipy",
+    "open3d>=0.18",
 ]
 
 [project.optional-dependencies]
@@ -37,4 +39,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["vggt_omega*"]
+include = ["selftr*", "vggt_omega*"]
