@@ -293,6 +293,29 @@ def trajectory_metrics(pred_c2w: np.ndarray, gt_c2w: np.ndarray) -> dict[str, fl
     }
 
 
+def reconstruction_overlap_and_normals(pred: np.ndarray, gt: np.ndarray, prefix: str, tau: float = 0.05) -> dict[str, float]:
+    """Bidirectional F1@tau and unoriented normal consistency for aligned clouds."""
+    gt_tree, pred_tree = cKDTree(gt), cKDTree(pred)
+    pred_to_gt, pred_indices = gt_tree.query(pred, workers=-1)
+    gt_to_pred, gt_indices = pred_tree.query(gt, workers=-1)
+    precision, recall = float(np.mean(pred_to_gt < tau)), float(np.mean(gt_to_pred < tau))
+    f1 = 0.0 if precision + recall == 0 else 2.0 * precision * recall / (precision + recall)
+    pred_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pred))
+    gt_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(gt))
+    pred_cloud.estimate_normals()
+    gt_cloud.estimate_normals()
+    pred_normals, gt_normals = np.asarray(pred_cloud.normals), np.asarray(gt_cloud.normals)
+    nc_pred_to_gt = np.abs(np.sum(pred_normals * gt_normals[pred_indices], axis=1))
+    nc_gt_to_pred = np.abs(np.sum(gt_normals * pred_normals[gt_indices], axis=1))
+    return {
+        f"{prefix}_precision_at_0.05m": precision,
+        f"{prefix}_recall_at_0.05m": recall,
+        f"{prefix}_f1_at_0.05m": f1,
+        f"{prefix}_nc": float((nc_pred_to_gt.mean() + nc_gt_to_pred.mean()) / 2),
+        f"{prefix}_nc_median": float((np.median(nc_pred_to_gt) + np.median(nc_gt_to_pred)) / 2),
+    }
+
+
 def reference_metrics(pred_depth: np.ndarray, pred_c2w: np.ndarray, gt_depth: np.ndarray, gt_c2w: np.ndarray) -> dict[str, float | int]:
     """Exact geometric core of the referenced VGGT benchmark's 7Scenes metric."""
     frames, height, width = pred_depth.shape
@@ -321,13 +344,15 @@ def reference_metrics(pred_depth: np.ndarray, pred_c2w: np.ndarray, gt_depth: np
     gt = np.asarray(gt_cloud.points)
     acc = cKDTree(gt).query(pred, workers=-1)[0]
     comp = cKDTree(pred).query(gt, workers=-1)[0]
-    return {
+    metrics = {
         "reference_acc_m": float(acc.mean()),
         "reference_comp_m": float(comp.mean()),
         "reference_cd_m": float((acc.mean() + comp.mean()) / 2),
         "reference_points": int(len(pred)),
         "reference_sim3_scale": float(scale),
     }
+    metrics.update(reconstruction_overlap_and_normals(pred, gt, "reference"))
+    return metrics
 
 
 def fastvggt_metrics(pred_points: np.ndarray, gt_depth: np.ndarray, gt_c2w: np.ndarray, *, sample_points: int, seed: int) -> dict[str, float | int]:
@@ -361,13 +386,15 @@ def fastvggt_metrics(pred_points: np.ndarray, gt_depth: np.ndarray, gt_c2w: np.n
     gt = np.asarray(gt_cloud.points)
     acc = cKDTree(gt).query(pred, workers=-1)[0]
     comp = cKDTree(pred).query(gt, workers=-1)[0]
-    return {
+    metrics = {
         "fastvggt_acc_m": float(acc.mean()),
         "fastvggt_comp_m": float(comp.mean()),
         "fastvggt_cd_m": float((acc.mean() + comp.mean()) / 2),
         "fastvggt_points_pred": int(len(pred)),
         "fastvggt_points_gt": int(len(gt)),
     }
+    metrics.update(reconstruction_overlap_and_normals(pred, gt, "fastvggt"))
+    return metrics
 
 
 def main() -> int:
@@ -410,6 +437,8 @@ def main() -> int:
         for key in (
             "reference_acc_m", "reference_comp_m", "reference_cd_m",
             "fastvggt_acc_m", "fastvggt_comp_m", "fastvggt_cd_m",
+            "reference_f1_at_0.05m", "reference_nc", "reference_nc_median",
+            "fastvggt_f1_at_0.05m", "fastvggt_nc", "fastvggt_nc_median",
             "ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg",
             "rra_30_percent", "rta_30_percent",
         )
@@ -433,6 +462,7 @@ def main() -> int:
             "reference_cd": "corresponding points + Sim(3) + ICP(0.1m) + bidirectional KD-tree mean / 2; 100000 deterministic points",
             "fastvggt_cd": "FastVGGT eval_7andN: central 224 crop + ICP(0.1m) + accuracy/completion mean / 2; independent deterministic samples capped at 999999",
             "fastvggt_random_seed": args.fastvggt_random_seed,
+            "reconstruction_overlap": "F1, precision, and recall at tau=0.05m; NC is bidirectional unoriented normal consistency",
             "pose": "official VGGT relative-pose AUC over all frame pairs; Sim(3)-aligned ATE/ARE/RPE/RRA/RTA follow the reference repository",
         },
         "summary": summary,

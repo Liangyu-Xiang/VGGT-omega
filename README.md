@@ -111,6 +111,9 @@ The GPU list can contain one GPU (sequential execution) or several GPUs
 (automatic round-robin partitioning). Set `EVAL_PYTHON` when the intended
 Python environment is not the default FastVGGT environment.
 
+The λ-ablation table includes both reconstruction protocols' CD, F1@5cm, and
+bidirectional unoriented normal consistency (NC), alongside the pose metrics.
+
 ## Layout
 
 ~~~text

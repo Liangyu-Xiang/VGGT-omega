@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 
 METRICS = (
-    "reference_cd_m", "fastvggt_cd_m", "auc_3_percent", "auc_5_percent", "auc_15_percent",
+    "reference_cd_m", "reference_f1_at_0.05m", "reference_nc", "reference_nc_median",
+    "fastvggt_cd_m", "fastvggt_f1_at_0.05m", "fastvggt_nc", "fastvggt_nc_median",
+    "auc_3_percent", "auc_5_percent", "auc_15_percent",
     "auc_30_percent", "ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg",
     "rra_30_percent", "rta_30_percent",
 )
