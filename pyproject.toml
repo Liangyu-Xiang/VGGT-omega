@@ -16,6 +16,7 @@ dependencies = [
     "opencv-python",
     "scipy",
     "open3d>=0.18",
+    "huggingface_hub",
 ]
 
 [project.optional-dependencies]
@@ -39,4 +40,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["selftr*", "vggt_omega*"]
+include = ["vggt", "vggt.*"]
