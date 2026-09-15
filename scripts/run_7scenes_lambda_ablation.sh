@@ -2,15 +2,20 @@
 set -euo pipefail
 
 # Formal SelTR lambda ablation: full 7Scenes test split, stride 3, no frame cap.
-# Usage: bash scripts/run_7scenes_lambda_ablation.sh /path/to/vggt_checkpoint.pt [output_root]
-CHECKPOINT=${1:?"usage: $0 CHECKPOINT [OUTPUT_ROOT]"}
-OUTPUT_ROOT=${2:-outputs/7scenes_lambda_ablation_stride3_full}
-DATASET_ROOT=${DATASET_ROOT:-/data_SSD1/mmc_lyxiang/3D/benchmark_stride_eval/datasets/7scenes}
+# Usage: bash scripts/run_7scenes_lambda_ablation.sh CHECKPOINT DATASET_ROOT GPU_LIST [OUTPUT_ROOT]
+# GPU_LIST is comma-separated (for example: 0 or 0,1,3). No server path/GPU is assumed.
+CHECKPOINT=${1:?"usage: $0 CHECKPOINT DATASET_ROOT GPU_LIST [OUTPUT_ROOT]"}
+DATASET_ROOT=${2:?"usage: $0 CHECKPOINT DATASET_ROOT GPU_LIST [OUTPUT_ROOT]"}
+GPU_LIST=${3:?"usage: $0 CHECKPOINT DATASET_ROOT GPU_LIST [OUTPUT_ROOT]"}
+OUTPUT_ROOT=${4:-outputs/7scenes_lambda_ablation_stride3_full}
 PYTHON_BIN=${EVAL_PYTHON:-/data/mmc_syang/miniconda3/envs/fastvggt/bin/python}
 [[ -x "$PYTHON_BIN" ]] || PYTHON_BIN=python
-GPU_0=${GPU_0:-4}
-GPU_1=${GPU_1:-5}
-GPU_2=${GPU_2:-6}
+IFS=',' read -r -a GPUS <<< "$GPU_LIST"
+(( ${#GPUS[@]} > 0 )) || { echo "GPU_LIST must not be empty" >&2; exit 2; }
+for gpu in "${GPUS[@]}"; do
+  [[ "$gpu" =~ ^[0-9]+$ ]] || { echo "invalid GPU id: $gpu" >&2; exit 2; }
+done
+LAMBDAS=(0.02 0.01 0.03 0.05 0.06 0.07 0.08 0.09 0.1)
 
 run_group() {
   local gpu=$1
@@ -27,11 +32,16 @@ run_group() {
   done
 }
 
-run_group "$GPU_0" 0.02 0.05 0.08 &
-PID_0=$!
-run_group "$GPU_1" 0.01 0.06 0.09 &
-PID_1=$!
-run_group "$GPU_2" 0.03 0.07 0.1 &
-PID_2=$!
-wait "$PID_0" "$PID_1" "$PID_2"
+PIDS=()
+for worker in "${!GPUS[@]}"; do
+  GROUP=()
+  for index in "${!LAMBDAS[@]}"; do
+    if (( index % ${#GPUS[@]} == worker )); then
+      GROUP+=("${LAMBDAS[index]}")
+    fi
+  done
+  run_group "${GPUS[worker]}" "${GROUP[@]}" &
+  PIDS+=("$!")
+done
+wait "${PIDS[@]}"
 "$PYTHON_BIN" scripts/summarize_7scenes_lambda_ablation.py --root "$OUTPUT_ROOT"

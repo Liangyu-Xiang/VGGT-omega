@@ -99,15 +99,17 @@ sampling.
 
 The formal SelTR λ ablation uses all 7Scenes test frames at stride 3, with no
 per-sequence frame cap. It evaluates λ = 0.02, 0.01, 0.03, 0.05, 0.06, 0.07,
-0.08, 0.09, and 0.10 on GPUs 4/5/6 by default and writes a final CSV/JSON
-table:
+0.08, 0.09, and 0.10 and writes a final CSV/JSON table. Specify the dataset
+path and one or more GPU IDs explicitly:
 
 ~~~bash
-bash scripts/run_7scenes_lambda_ablation.sh pretrained_ckpts/vggt_1b.pt
+bash scripts/run_7scenes_lambda_ablation.sh pretrained_ckpts/vggt_1b.pt \
+  /path/to/7scenes 0,1,3
 ~~~
 
-Set `GPU_0`, `GPU_1`, `GPU_2`, `DATASET_ROOT`, or `EVAL_PYTHON` to override
-the launch environment.
+The GPU list can contain one GPU (sequential execution) or several GPUs
+(automatic round-robin partitioning). Set `EVAL_PYTHON` when the intended
+Python environment is not the default FastVGGT environment.
 
 ## Layout
 
