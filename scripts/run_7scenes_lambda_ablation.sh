@@ -19,7 +19,13 @@ LAMBDAS=(0.02 0.01 0.03 0.05 0.06 0.07 0.08 0.09 0.1)
 
 run_group() {
   local gpu=$1
-  shift
+  local include_dense=$2
+  shift 2
+  if [[ "$include_dense" == "true" && ! -f "$OUTPUT_ROOT/densevggt/metrics.json" ]]; then
+    CUDA_VISIBLE_DEVICES=$gpu "$PYTHON_BIN" scripts/eval_7scenes.py \
+      --method vggt --checkpoint "$CHECKPOINT" --dataset-root "$DATASET_ROOT" \
+      --output-dir "$OUTPUT_ROOT/densevggt" --device cuda:0 --stride 3
+  fi
   for lambda_cost in "$@"; do
     local output="$OUTPUT_ROOT/lambda_${lambda_cost}"
     if [[ -f "$output/metrics.json" ]]; then
@@ -40,7 +46,11 @@ for worker in "${!GPUS[@]}"; do
       GROUP+=("${LAMBDAS[index]}")
     fi
   done
-  run_group "${GPUS[worker]}" "${GROUP[@]}" &
+  if (( worker == 0 )); then
+    run_group "${GPUS[worker]}" true "${GROUP[@]}" &
+  else
+    run_group "${GPUS[worker]}" false "${GROUP[@]}" &
+  fi
   PIDS+=("$!")
 done
 wait "${PIDS[@]}"

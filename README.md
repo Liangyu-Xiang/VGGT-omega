@@ -111,8 +111,11 @@ The GPU list can contain one GPU (sequential execution) or several GPUs
 (automatic round-robin partitioning). Set `EVAL_PYTHON` when the intended
 Python environment is not the default FastVGGT environment.
 
-The λ-ablation table includes both reconstruction protocols' CD, F1@5cm, and
-bidirectional unoriented normal consistency (NC), alongside the pose metrics.
+The λ-ablation table includes DenseVGGT once and every SelTR λ setting. It
+reports both reconstruction protocols' CD, F1@5cm, bidirectional unoriented
+normal consistency (NC), pose metrics, total forward time, per-frame latency,
+FPS, peak allocated/reserved VRAM, and Token Retention Ratio. SelTR records
+the ratio separately for all three grouping stages.
 
 ## Layout
 

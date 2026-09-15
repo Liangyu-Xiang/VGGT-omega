@@ -12,8 +12,22 @@ METRICS = (
     "fastvggt_cd_m", "fastvggt_f1_at_0.05m", "fastvggt_nc", "fastvggt_nc_median",
     "auc_3_percent", "auc_5_percent", "auc_15_percent",
     "auc_30_percent", "ate_rmse_m", "are_deg", "rpe_translation_rmse_m", "rpe_rotation_rmse_deg",
-    "rra_30_percent", "rta_30_percent",
+    "rra_30_percent", "rta_30_percent", "total_inference_time_s", "mean_latency_s_per_frame",
+    "fps", "peak_vram_allocated_gib", "peak_vram_reserved_gib",
 )
+
+
+def summary_row(method: str, protocol: dict, summary: dict) -> dict:
+    row = {"method": method, "lambda_cost": protocol["lambda_cost"], "stride": protocol["stride"],
+           "max_frames_per_sequence": protocol["max_frames_per_sequence"],
+           **{key: summary.get(key) for key in METRICS}}
+    retention = summary.get("token_retention", {})
+    if retention.get("policy") == "selftr_stagewise":
+        for stage in retention.get("stages", []):
+            row[f"token_retention_stage_{stage['stage']}_percent"] = stage.get("mean_retention_percent")
+    else:
+        row["token_retention_percent"] = retention.get("retention_percent")
+    return row
 
 
 def main() -> None:
@@ -21,13 +35,16 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     args = parser.parse_args()
     rows = []
+    dense_path = args.root / "densevggt" / "metrics.json"
+    if dense_path.is_file():
+        payload = json.loads(dense_path.read_text())
+        protocol, summary = payload["protocol"], payload["summary"]
+        rows.append(summary_row("densevggt", protocol, summary))
     for path in sorted(args.root.glob("lambda_*/metrics.json")):
         payload = json.loads(path.read_text())
         protocol, summary = payload["protocol"], payload["summary"]
-        rows.append({"lambda_cost": protocol["lambda_cost"], "stride": protocol["stride"],
-                     "max_frames_per_sequence": protocol["max_frames_per_sequence"],
-                     **{key: summary.get(key) for key in METRICS}})
-    rows.sort(key=lambda row: row["lambda_cost"])
+        rows.append(summary_row("selftr", protocol, summary))
+    rows.sort(key=lambda row: (row["method"] != "densevggt", row["lambda_cost"] or 0.0))
     if not rows:
         raise FileNotFoundError(f"no lambda_*/metrics.json under {args.root}")
     (args.root / "lambda_ablation.json").write_text(json.dumps(rows, indent=2) + "\n")

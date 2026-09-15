@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Mapping
 
@@ -159,17 +160,53 @@ def c2w_from_pose_encoding(pose_enc: torch.Tensor, image_hw: tuple[int, int]) ->
     return torch.linalg.inv(torch.cat((w2c, bottom), dim=-2)[0]).float().cpu().numpy()
 
 
-def forward(model: VGGT, images: list[Path], device: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def token_retention(model: VGGT, method: str) -> dict[str, object]:
+    if method == "vggt":
+        return {"policy": "dense_fixed", "retention_percent": 100.0}
+    stats = list(getattr(model.aggregator, "last_token_merging_stats", []))
+    if method == "fastvggt":
+        ratio = next((row.get("full_attention_token_ratio") for row in stats if "full_attention_token_ratio" in row), None)
+        return {"policy": "fastvggt_fixed", "retention_percent": None if ratio is None else 100.0 * float(ratio)}
+    refresh_layers = sorted(getattr(model.aggregator, "um_refresh_layers", {0, 9, 21}))
+    stages = []
+    for block in refresh_layers:
+        stat = next((row for row in stats if row.get("block") == block and "full_attention_token_ratio" in row), None)
+        if stat is not None:
+            stages.append({"stage": len(stages) + 1, "block": int(block),
+                           "retention_percent": 100.0 * float(stat["full_attention_token_ratio"])})
+    return {"policy": "selftr_stagewise", "stages": stages,
+            "mean_retention_percent": float(np.mean([stage["retention_percent"] for stage in stages])) if stages else None}
+
+
+def forward(model: VGGT, images: list[Path], device: str, method: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
     batch = load_and_preprocess_images([str(path) for path in images], mode="crop").to(device)
+    cuda = str(device).startswith("cuda")
+    if hasattr(model.aggregator, "last_token_merging_stats"):
+        model.aggregator.last_token_merging_stats = []
+    if cuda:
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    start = time.perf_counter()
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda")):
         prediction = model(batch)
+    if cuda:
+        torch.cuda.synchronize(device)
+    inference_time_s = time.perf_counter() - start
+    efficiency = {
+        "inference_time_s": inference_time_s,
+        "latency_s_per_frame": inference_time_s / len(images),
+        "fps": len(images) / inference_time_s,
+        "peak_vram_allocated_gib": torch.cuda.max_memory_allocated(device) / 1024**3 if cuda else 0.0,
+        "peak_vram_reserved_gib": torch.cuda.max_memory_reserved(device) / 1024**3 if cuda else 0.0,
+        "token_retention": token_retention(model, method),
+    }
     depth = prediction["depth"][0, ..., 0].float().cpu().numpy()
     points = prediction["world_points"][0].float().cpu().numpy()
     c2w = c2w_from_pose_encoding(prediction["pose_enc"], tuple(batch.shape[-2:]))
     del prediction, batch
-    if str(device).startswith("cuda"):
+    if cuda:
         torch.cuda.empty_cache()
-    return depth, points, c2w
+    return depth, points, c2w, efficiency
 
 
 def scaled_intrinsics(frames: int, target_hw: tuple[int, int]) -> np.ndarray:
@@ -414,7 +451,7 @@ def main() -> int:
     for sequence in test_sequences(args.dataset_root, args.sequences):
         images, source_indices = sequence_inputs(args.dataset_root, sequence, args.stride, args.num_frames)
         print(f"{sequence}: forwarding {len(images)} frames (source stride {args.stride})", flush=True)
-        pred_depth, pred_points, pred_c2w = forward(model, images, args.device)
+        pred_depth, pred_points, pred_c2w, efficiency = forward(model, images, args.device, args.method)
         gt_depth = np.stack([read_gt_depth(path) for path in gt_depth_paths(images)])
         gt_c2w = np.stack([np.loadtxt(path.with_name(path.name.replace(".color.png", ".pose.txt")), dtype=np.float64) for path in images])
         row: dict[str, object] = {"sequence": sequence, "frames": len(images), "source_frame_indices": source_indices}
@@ -426,10 +463,12 @@ def main() -> int:
         all_translation_errors.extend(pose.pop("_translation_errors"))
         row.update(pose)
         row.update(trajectory_metrics(pred_c2w, gt_c2w))
+        row["efficiency"] = efficiency
         rows.append(row)
         print(
             f"{sequence}: reference_CD={row['reference_cd_m']:.6f} m, "
-            f"FastVGGT_CD={row['fastvggt_cd_m']:.6f} m, AUC@3={row['auc_3_percent']:.2f}",
+            f"FastVGGT_CD={row['fastvggt_cd_m']:.6f} m, AUC@3={row['auc_3_percent']:.2f}, "
+            f"FPS={efficiency['fps']:.2f}",
             flush=True,
         )
     summary = {
@@ -453,6 +492,28 @@ def main() -> int:
         "mean_rotation_error_deg": float(np.mean(all_rotation_errors)),
         "mean_translation_error_deg": float(np.mean(all_translation_errors)),
     })
+    efficiencies = [row["efficiency"] for row in rows]
+    total_time = float(sum(float(item["inference_time_s"]) for item in efficiencies))
+    total_frames = int(sum(int(row["frames"]) for row in rows))
+    summary.update({
+        "total_inference_time_s": total_time,
+        "mean_latency_s_per_frame": float(np.mean([float(item["latency_s_per_frame"]) for item in efficiencies])),
+        "fps": total_frames / total_time if total_time > 0 else None,
+        "peak_vram_allocated_gib": float(max(float(item["peak_vram_allocated_gib"]) for item in efficiencies)),
+        "peak_vram_reserved_gib": float(max(float(item["peak_vram_reserved_gib"]) for item in efficiencies)),
+    })
+    if args.method == "selftr":
+        stages = []
+        for stage_index in range(3):
+            values = [entry["token_retention"]["stages"][stage_index]["retention_percent"]
+                      for entry in efficiencies if len(entry["token_retention"].get("stages", [])) > stage_index]
+            stages.append({"stage": stage_index + 1, "mean_retention_percent": float(np.mean(values)) if values else None})
+        summary["token_retention"] = {"policy": "selftr_stagewise", "stages": stages}
+    else:
+        values = [entry["token_retention"].get("retention_percent") for entry in efficiencies]
+        values = [value for value in values if value is not None]
+        summary["token_retention"] = {"policy": "dense_fixed" if args.method == "vggt" else "fastvggt_fixed",
+                                      "retention_percent": float(np.mean(values)) if values else None}
     payload = {
         "protocol": {
             "dataset": "7Scenes official test split", "method": args.method, "stride": args.stride,
@@ -464,6 +525,7 @@ def main() -> int:
             "fastvggt_random_seed": args.fastvggt_random_seed,
             "reconstruction_overlap": "F1, precision, and recall at tau=0.05m; NC is bidirectional unoriented normal consistency",
             "pose": "official VGGT relative-pose AUC over all frame pairs; Sim(3)-aligned ATE/ARE/RPE/RRA/RTA follow the reference repository",
+            "efficiency": "model forward only; excludes image decoding/preprocessing and CPU metric computation; peak VRAM is per-sequence maximum",
         },
         "summary": summary,
         "per_sequence": rows,
